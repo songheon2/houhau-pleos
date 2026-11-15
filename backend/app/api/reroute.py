@@ -1,0 +1,105 @@
+"""POST /api/route/reroute: rain got worse during a drive.
+
+Decides from the car's position and the rest of the route, and returns the reason as a template
+sentence filled with the computed numbers. Coordinates are not stored or logged.
+"""
+import math
+import time
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ..config import AppConfig, rain_level
+from ..context.weather_kma import KmaWeatherService, get_weather_service
+from ..engines import get_engine
+from ..engines.base import EngineUnavailable, RoutingEngine
+from ..reroute import decide, remaining_route
+from ..risk.geo import in_service_area
+from ..risk.layer import RiskLayer
+from ..route_explainer import RerouteInput, ZoneLength, reroute_facts, reroute_template
+from ..strategies.base import RouteNotFound, RouteRequest, ScoredRoute, StrategyContext
+from ..strategies.params import ParamsError, resolve
+from ..strategies.registry import get_strategy
+from .deps import config_dep, layer_dep
+from .explain import zone_labels
+from .route import ENGINE_DOWN, MAX_GUIDANCE_POINTS, NO_ROUTE, OUTSIDE, Point, WeatherOverride, timeout_s, weather_context
+
+router = APIRouter(prefix="/api/route", tags=["route"])
+# Worse rain is judged by the rain level's rules, whatever algorithm drew the route being driven:
+# baseline and rerank have no list of zones to avoid, which would read as "nothing to avoid".
+REROUTE_STRATEGY = "tiered_rain"
+
+
+class RerouteBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    position: Point
+    destination: Point
+    heading: float | None = Field(default=None, ge=-360, le=360)
+    remaining: list[tuple[float, float]] = Field(min_length=2, max_length=MAX_GUIDANCE_POINTS)
+    remaining_duration_s: float = Field(ge=0, le=172_800)
+    previous: WeatherOverride  # the rain the current route was last checked against
+    weather_override: WeatherOverride | None = None
+
+    @field_validator("remaining")
+    @classmethod
+    def _finite(cls, value: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not all(math.isfinite(n) for point in value for n in point):
+            raise ValueError("must be finite")
+        return value
+
+
+def _side(route: ScoredRoute, hard: tuple[str, ...], soft: tuple[str, ...]) -> dict[str, Any]:
+    return {"duration_s": round(route.osrm["duration"], 1), "distance_m": round(route.osrm["distance"], 1),
+            "zones": [p.as_dict() for p in route.exposure.passes],
+            "hard_zone_ids": sorted(route.exposure.zone_ids(hard)),
+            "soft_zone_ids": sorted(route.exposure.zone_ids(soft))}
+
+
+def _lengths(route: ScoredRoute) -> tuple[ZoneLength, ...]:
+    return tuple(ZoneLength(p.zone.id, p.length_m) for p in route.exposure.passes)
+
+
+@router.post("/reroute")
+def reroute(body: RerouteBody,
+            config: Annotated[AppConfig, Depends(config_dep)],
+            layer: Annotated[RiskLayer, Depends(layer_dep)],
+            engine: Annotated[RoutingEngine, Depends(get_engine)],
+            weather_service: Annotated[KmaWeatherService, Depends(get_weather_service)]):
+    origin = (body.position.lon, body.position.lat)
+    destination = (body.destination.lon, body.destination.lat)
+    if not (in_service_area(*origin) and in_service_area(*destination)):
+        raise HTTPException(422, OUTSIDE)
+    strategy = get_strategy(REROUTE_STRATEGY)
+    try:
+        params = resolve(config, strategy.params_model, {})
+    except ParamsError as exc:
+        raise HTTPException(422, str(exc)) from None
+    started = time.monotonic()
+    weather = weather_context(body.weather_override, weather_service, params, origin)
+    ctx = StrategyContext(weather=weather, layer=layer, engine=engine, params=params,
+                          deadline=started + timeout_s(config))
+    request = RouteRequest(origin, destination, body.heading)
+    try:
+        plan = strategy.plan(request, ctx)
+        hard, soft = plan.explanation.hard_groups, plan.explanation.soft_groups
+    except EngineUnavailable:
+        raise HTTPException(503, ENGINE_DOWN) from None
+    except RouteNotFound:
+        raise HTTPException(422, NO_ROUTE) from None
+    current = remaining_route(ctx, body.remaining, body.remaining_duration_s)
+    action = decide(ctx, plan.route, current, hard, soft)
+    previous_level = rain_level(body.previous.rn1_mm, body.previous.alert, params.thresholds_mm, params.alert_min_level)
+    labels, tier_labels = zone_labels(config)
+    facts = reroute_facts(
+        RerouteInput(action=action, previous_rn1_mm=body.previous.rn1_mm, previous_alert=body.previous.alert,
+                     previous_level=previous_level, rn1_mm=weather.rn1_mm, alert=weather.alert, level=weather.level,
+                     current_duration_s=current.osrm["duration"], candidate_duration_s=plan.route.osrm["duration"],
+                     current_zones=_lengths(current), candidate_zones=_lengths(plan.route), hard_groups=hard, soft_groups=soft),
+        {z.id: z for z in layer.zones}, labels, tier_labels)
+    candidate_ids = plan.route.exposure.zone_ids()
+    return {"action": action, "status": plan.explanation.status, "hard_groups": list(hard), "soft_groups": list(soft),
+            "previous_level": previous_level, "weather": weather.as_dict(), "route": plan.route.osrm,
+            "current": _side(current, hard, soft), "candidate": _side(plan.route, hard, soft),
+            "avoided_zone_ids": sorted(current.exposure.zone_ids((*hard, *soft)) - candidate_ids),
+            "text": reroute_template(facts)}

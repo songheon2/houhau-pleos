@@ -1,0 +1,41 @@
+# Risk-zone pipeline settings. Paths are relative to this file.
+version: 1
+output: ../backend/app/data/risk_zones.geojson
+
+# Points and lines are grown by this radius (metres, EPSG:5179) to become polygons.
+# This is the zone itself. The extra avoidance buffer used for routing lives in
+# backend/app/config/strategies.yaml (avoid_buffer_m).
+default_radius_m:
+  underpass:     {Point: 50, LineString: 12, MultiLineString: 12}
+  flood_history: {Point: 30, LineString: 12}
+  riverside:     {LineString: 40}
+
+# Flood-history terrain tiers, written as risk_tier / tier_reason.
+# high: flood_count >= repeat_count, low_pct < high_below_low_pct, or elevation missing/partial.
+# raised: 1회 침수 and low_pct >= raised_from_low_pct. normal: the rest.
+# Starting values, not validated (risk_zones_guide(DEM).md 6-7). 15 (about the lowest 10%) instead
+# of the guide's 20: with 20 scenario A gave the same route at 55 and 75 mm.
+flood_tiers:
+  repeat_count: 2
+  high_below_low_pct: 15
+  raised_from_low_pct: 50
+
+sources:
+  # Real data only. The hand-drawn dummy zones (sources/dummy_seed.json) were removed on
+  # 2026-10-30; riverside has no zones until real data is added.
+  # 광주 5개 구 침수 피해 기록 2021~2025 -> 935 flood_history polygons, with DEM
+  # elevation (see risk_zones_guide(DEM).md at the repository root).
+  - {reader: flood_zone_geojson, path: sources/gwangju_flood_zones.geojson}
+  # Underpass list (points) tied to OSM tunnels. sources/osm_tunnels.geojson comes
+  # from extract_osm_tunnels.py. Points without a tunnel are left out and reported on stderr.
+  # The source of the list is not confirmed yet: replace source_name when it is.
+  - reader: underpass_csv
+    path: sources/gwangju_underpasses.csv
+    tunnels: osm_tunnels.geojson
+    match_radius_m: 60
+    source_name: 지하차도 위치 목록(출처 확인 중)·OpenStreetMap
+    source_url: https://www.openstreetmap.org/copyright
+    checked_at: "2026-10-31"
+  # Other real data, once downloaded (readers are placeholders in readers.py):
+  # - {reader: flood_trace_shp, path: raw/flood_traces.shp}
+  # - {reader: river_centerline, path: raw/rivers.geojson}
